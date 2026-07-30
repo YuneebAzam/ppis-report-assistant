@@ -34,6 +34,7 @@ Windows; otherwise run `ollama serve`).
 import bisect
 import json
 import re
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -64,11 +65,10 @@ def decode_cid(s):
     return CID_RE.sub(lambda m: chr(int(m.group(1))), s)
 
 
-def get_word_lines(page):
-    """Words grouped into visual lines, with the cid encoding decoded."""
-    words = page.extract_words(x_tolerance=1)
-    for w in words:
-        w["text"] = re.sub(r"\s+", " ", decode_cid(w["text"])).strip()
+def group_words_into_lines(words):
+    """Shared by both extraction paths (pdfplumber's real text layer and
+    the OCR fallback below): cluster words into visual lines by vertical
+    position, each word a dict with text/x0/x1/top in PDF point units."""
     words = [w for w in words if w["text"]]
     words.sort(key=lambda w: (w["top"], w["x0"]))
     lines, cur, cur_top = [], [], None
@@ -84,6 +84,99 @@ def get_word_lines(page):
     for ln in lines:
         ln.sort(key=lambda w: w["x0"])
     return lines
+
+
+def get_word_lines(page):
+    """Words grouped into visual lines, with the cid encoding decoded."""
+    words = page.extract_words(x_tolerance=1)
+    for w in words:
+        w["text"] = re.sub(r"\s+", " ", decode_cid(w["text"])).strip()
+    return group_words_into_lines(words)
+
+
+def text_is_usable(decoded_text):
+    """Distinguishes this report's known (cid:NN) quirk (which decode_cid
+    fixes, producing normal readable characters) from a genuinely broken
+    or missing font encoding in the source PDF, where pdfminer can't
+    resolve glyphs to Unicode at all and emits raw control characters
+    when decode_cid naively maps the cid number to chr(). No text-layer
+    fix exists for that case -- see the OCR fallback below."""
+    if not decoded_text.strip():
+        return False
+    printable = sum(1 for c in decoded_text if c.isprintable() or c in "\n\t")
+    return printable / len(decoded_text) > 0.85
+
+
+def pdf_needs_ocr(pdf_path):
+    """Sample a few pages spread across the document; if none of them
+    decode to usable text, the whole PDF's font encoding is broken and
+    every page will need OCR (checked once, not per-page, since a
+    document's font setup doesn't usually vary page to page)."""
+    with pdfplumber.open(pdf_path) as pdf:
+        n = len(pdf.pages)
+        idxs = sorted({0, n // 2, n - 1, min(n - 1, 5)})
+        for i in idxs:
+            raw = pdf.pages[i].extract_text() or ""
+            if text_is_usable(decode_cid(raw)):
+                return False
+    return True
+
+
+def locate_tesseract():
+    """pytesseract needs to be told where the tesseract binary is on
+    Windows (it isn't reliably on PATH after installation); on Linux
+    (e.g. a Codespace with `apt-get install tesseract-ocr`) it's on PATH
+    already, so this returns None and pytesseract finds it itself."""
+    if shutil.which("tesseract"):
+        return None
+    for p in (r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+              r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"):
+        if Path(p).exists():
+            return p
+    return None
+
+
+OCR_DPI = 400  # 200-300 loses real detail on this report's dense, small-
+               # font tables (e.g. an operator column reading blank or a
+               # single garbled letter instead of "PPL") -- 400 recovers
+               # it at negligible extra time cost (~3% slower per page).
+
+
+def get_word_lines_ocr(fitz_page, dpi=OCR_DPI):
+    """OCR-based equivalent of get_word_lines(), used when the PDF's own
+    text layer is unusable (see pdf_needs_ocr). Renders the page to an
+    image and reads it visually with Tesseract, which sidesteps the
+    broken font encoding entirely since it never touches embedded text.
+    Word pixel coordinates are converted back to PDF point units
+    (dividing by dpi/72) so they're compatible with the same
+    column-boundary and line-clustering thresholds already tuned for
+    get_word_lines()'s output."""
+    import fitz
+    import pytesseract
+    from PIL import Image
+
+    zoom = dpi / 72
+    mat = fitz.Matrix(zoom, zoom)
+    pix = fitz_page.get_pixmap(matrix=mat)
+    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+
+    tcmd = locate_tesseract()
+    if tcmd:
+        pytesseract.pytesseract.tesseract_cmd = tcmd
+    data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+
+    words = []
+    for i in range(len(data["text"])):
+        text = re.sub(r"\s+", " ", data["text"][i]).strip()
+        if not text or int(data["conf"][i]) < 0:
+            continue
+        words.append({
+            "text": text,
+            "x0": data["left"][i] / zoom,
+            "x1": (data["left"][i] + data["width"][i]) / zoom,
+            "top": data["top"][i] / zoom,
+        })
+    return group_words_into_lines(words)
 
 
 def detect_boundaries(lines):
@@ -116,6 +209,7 @@ def detect_boundaries(lines):
 
 
 SUBTOTAL_RE = re.compile(r"^Sub-?\s?Totals?:?$", re.IGNORECASE)
+SUBTOTAL_NAMED_RE = re.compile(r"^Sub[\s-]?Totals?\s*\(([^)]+)\)$", re.IGNORECASE)
 TOTALROW_RE = re.compile(r"^(Sub-?\s?Totals?:?( for .*)?|Grand )?Totals?"
                          r"( area)?:?$", re.IGNORECASE)
 NUMCELL_RE = re.compile(r"^-?[\d.,()/%\s]+$")
@@ -180,11 +274,24 @@ def section_boundaries(section, pages_words):
     return clusters if len(clusters) >= 2 else None
 
 
+TITLE_CONNECTOR_RE = re.compile(r"\b(as|of|on|during|held|by|for|in)\b",
+                                re.IGNORECASE)
+
+
 def section_title(first_page_lines):
     """The section's display title: the most informative of the page's
     first few lines (chapter names like 'Concession Activities' repeat on
     every page and say nothing; the actual table name is usually the
-    longest line, e.g. 'Exploration Licences held by companies ...')."""
+    longest line, e.g. 'Exploration Licences held by companies ...').
+
+    A column-header row (e.g. 'Company Field Discovery Year Original
+    Comulative Balance') can be longer, in raw character count, than the
+    true title line ('Oil Reserves as on 30th June 2015 ...') -- but a
+    real title reads as a phrase with connecting words, while a header
+    row is just a list of capitalized labels with none. Prefer lines
+    with a connector when picking the longest candidate, since losing a
+    disambiguating word here (e.g. "Oil" vs "Gas") makes two differently
+    named tables in the report indistinguishable by title alone."""
     def plain(ln):
         return re.sub(r"\s+", " ", " ".join(w["text"] for w in ln)).strip()
     header = [plain(ln) for ln in first_page_lines[:4]]
@@ -192,7 +299,9 @@ def section_title(first_page_lines):
     if not header:
         return "Untitled"
     candidates = [t for t in header if not re.search(r"\bTable\s+\d", t)]
-    title = max(candidates, key=len) if candidates else header[0]
+    with_connector = [t for t in candidates if TITLE_CONNECTOR_RE.search(t)]
+    pool = with_connector or candidates
+    title = max(pool, key=len) if pool else header[0]
     for t in header:
         m = re.search(r"\bTable\s+\d+(\.\d+)?", t)
         if m:
@@ -206,6 +315,80 @@ def find_entity_col(col_labels):
         if lbl and ENTITY_COL_RE.search(lbl):
             return i
     return 0
+
+
+ZONE_WORD_RE = re.compile(r"\b(Exploration|Appraisal|Development)\b",
+                          re.IGNORECASE)
+
+
+NUM_TOKEN_RE = re.compile(r"-?[\d,]+\.\d+")
+
+
+ZONE_COLUMN_LABELS = [
+    "G & G Studies (Exploration)", "Exploratory Drilling (Exploration)",
+    "Other Expenditure (Exploration)", "Exploration Total (In MM Rs.)",
+    "G & G Studies (Appraisal)", "Appraisal Drilling (Appraisal)",
+    "Other Expenditure (Appraisal)", "Appraisal Total (In MM Rs.)",
+    "Development Drilling", "Production Facilities",
+    "Other Expenditure (Development)", "Development Total (In MM Rs.)",
+]
+
+
+def relabel_zone_totals(row_cells, table_title):
+    """Table 5.2 always has exactly 12 numbers per data row: 4 per section
+    (G&G/drilling/Other/Total), always in Exploration -> Appraisal ->
+    Development order -- a fixed structural property of this table, used
+    instead of matching column-label text because columns here are packed
+    only a few points apart (breaking text alignment) and the merged
+    group-header words don't survive per-column splitting cleanly.
+
+    Rather than relabelling only the 3 section-total columns and leaving
+    the rest of the row's fragile, sometimes-nonsensical auto-joined
+    labels in place, replace all 12 numeric columns with clean labels
+    (keeping only the genuinely non-numeric cells -- company/block name
+    -- as they were). A row full of garbled intermediate labels gives a
+    small model more surface area to misread than a clean one."""
+    # Gate on "Expenditure" alone, not the full "Exploration"+"Development"
+    # phrase -- section_title() can legitimately pick different header
+    # lines for the same table (e.g. "Exploration and Production
+    # Expenditure During 2014-2015" instead of the zone-line "Exploration
+    # Expenditure Appraisal Expenditure Development Expenditure"), and
+    # this must not depend on exact title wording. The 12-number check
+    # below is what actually makes this specific to this table's shape.
+    if "Expenditure" not in table_title:
+        return row_cells
+    nums = [n for v in row_cells.values() for n in NUM_TOKEN_RE.findall(v)]
+    if len(nums) != 12:
+        return row_cells  # not a fully-populated row of this table's shape
+    out = {k: v for k, v in row_cells.items() if not NUM_TOKEN_RE.search(v)}
+    out.update(zip(ZONE_COLUMN_LABELS, nums))
+    return out
+
+
+def fill_zone_header(header_line):
+    """Some report tables print a merged-cell group header spanning
+    several sub-columns (e.g. "Exploration Expenditure | Appraisal
+    Expenditure | Development Expenditure", each covering 4 numeric
+    columns beneath it). In the PDF's raw text each zone word only has
+    ONE x-position, so it lands in exactly one column bin -- the other
+    columns in that zone would otherwise get no label at all, making
+    e.g. every "Total (In MM Rs.)" column indistinguishable. If this
+    line has 2+ zone words, forward-fill each one across the empty
+    columns to its right until the next zone word appears."""
+    hits = sum(1 for c in header_line if c and ZONE_WORD_RE.search(c))
+    if hits < 2:
+        return header_line
+    filled, current = list(header_line), ""
+    for i, c in enumerate(filled):
+        if c:
+            m = ZONE_WORD_RE.search(c)
+            if m:
+                current = m.group(1).title()
+            # non-empty cell with no zone word: it's a real column label
+            # (e.g. "Licence/", "Develop.") -- never overwrite it.
+        elif current:
+            filled[i] = current  # empty cell: forward-fill the zone name
+    return filled
 
 
 def render_page(lines, bounds, state, pageno, title, rows):
@@ -238,9 +421,11 @@ def render_page(lines, bounds, state, pageno, title, rows):
             n_num = sum(1 for c in cells if c and NUMCELL_RE.match(c))
             if state["col_labels"] is None:
                 if n_num >= 2 and sum(1 for c in cells if c) >= 3:
+                    header_lines = [fill_zone_header(h)
+                                    for h in state["header_cells"][-3:]]
                     col_labels = []
                     for i in range(len(cells)):
-                        parts = [h[i] for h in state["header_cells"][-3:]
+                        parts = [h[i] for h in header_lines
                                  if i < len(h) and h[i]]
                         col_labels.append(" ".join(parts).strip())
                     state["col_labels"] = col_labels
@@ -249,18 +434,44 @@ def render_page(lines, bounds, state, pageno, title, rows):
                     state["header_cells"].append(cells)
             col_labels = state["col_labels"]
             is_subtotal = any(SUBTOTAL_RE.match(c) for c in cells)
+            # Some tables print the company name directly inside the
+            # subtotal cell, e.g. "Sub Total (UEPL)" as one unit, instead
+            # of a bare "Sub-Total" relying on the tracked entity -- this
+            # is a more reliable signal than fill-down when present, and
+            # doesn't depend on the company name having been seen earlier.
+            named_subtotal = next(
+                (m for c in cells if (m := SUBTOTAL_NAMED_RE.match(c))), None)
 
             entity = ""
             if col_labels is not None and n_num >= 1:
                 ecol = state.get("entity_col", 0)
+                # Column boundaries are shared across the whole section,
+                # but different company codes' text sits at slightly
+                # different x-positions (sub-point rendering variance),
+                # so the same boundary can bisect one company's word but
+                # not another's, landing it one bin to the left of where
+                # the header text put entity_col. Only fall back to that
+                # bin when the primary one is empty -- never glue the two
+                # together, since the left bin can hold unrelated content
+                # (a stray number, another column's word) when the
+                # primary bin already has the real company name.
                 ecell = cells[ecol] if ecol < len(cells) else ""
+                if not ecell and ecol > 0:
+                    ecell = cells[ecol - 1]
                 if not is_subtotal and ecell \
                         and ecell.lower() not in FRAG_STOP \
                         and not FRAG_SKIP_RE.match(ecell) \
                         and not re.match(r"^[\d.,()-]+$", ecell):
                     state["current_entity"] = ecell
                 entity = state.get("current_entity", "")
-                if is_subtotal and entity:
+                if named_subtotal:
+                    entity = named_subtotal.group(1).strip()
+                    is_subtotal = True
+                    state["current_entity"] = ""
+                    for i, c in enumerate(cells):
+                        if SUBTOTAL_NAMED_RE.match(c):
+                            cells[i] = f"Sub-Total for {entity}"
+                elif is_subtotal and entity:
                     for i, c in enumerate(cells):
                         if SUBTOTAL_RE.match(c):
                             cells[i] = f"Sub-Total for {entity}"
@@ -276,6 +487,7 @@ def render_page(lines, bounds, state, pageno, title, rows):
                         key = f"{col_labels[i]} ({n})"
                         n += 1
                     row_cells[key] = cells[i]
+                row_cells = relabel_zone_totals(row_cells, title)
                 if row_cells:
                     is_total = is_subtotal or any(
                         TOTALROW_RE.match(c) for c in cells)
@@ -324,15 +536,37 @@ def chunk_narrative_pages(section, page_text_lines, chunks):
                 break
 
 
-def extract_all(pdf_path=PDF_PATH, progress=None):
-    """progress: optional callback(stage_label, done, total)."""
-    with pdfplumber.open(pdf_path) as pdf:
-        n = len(pdf.pages)
-        pages_words = []
-        for i, page in enumerate(pdf.pages):
-            pages_words.append(get_word_lines(page))
+def extract_all(pdf_path=PDF_PATH, progress=None, ocr_flag=None):
+    """progress: optional callback(stage_label, done, total).
+    ocr_flag: optional dict; ["used"] is set True if OCR was needed, so
+    the caller can record it in the index metadata (retrieval treats
+    OCR-sourced tables as less trustworthy -- see app.py)."""
+    use_ocr = pdf_needs_ocr(pdf_path)
+    if ocr_flag is not None:
+        ocr_flag["used"] = use_ocr
+    pages_words = []
+    if use_ocr:
+        # This PDF's embedded text has no usable font encoding at all (a
+        # defect in the source file -- confirmed by testing two separate
+        # PDF libraries, both failing identically). Read every page
+        # visually with OCR instead; much slower than the text layer, so
+        # progress reporting says so.
+        import fitz
+        doc = fitz.open(pdf_path)
+        n = len(doc)
+        for i in range(n):
+            pages_words.append(get_word_lines_ocr(doc[i]))
             if progress:
-                progress("Reading pages", i + 1, n)
+                progress("Reading pages (OCR -- slower, no text layer "
+                         "in this PDF)", i + 1, n)
+        doc.close()
+    else:
+        with pdfplumber.open(pdf_path) as pdf:
+            n = len(pdf.pages)
+            for i, page in enumerate(pdf.pages):
+                pages_words.append(get_word_lines(page))
+                if progress:
+                    progress("Reading pages", i + 1, n)
 
     sections = group_into_sections(pages_words)
     rows, chunks = [], []
@@ -382,7 +616,8 @@ def build_index(pdf_path=PDF_PATH, progress=None):
     index files. Returns the meta dict. Used by both the CLI (main) and
     the app's upload button."""
     pdf_path = Path(pdf_path)
-    rows, chunks = extract_all(pdf_path, progress)
+    ocr_flag = {"used": False}
+    rows, chunks = extract_all(pdf_path, progress, ocr_flag)
 
     INDEX_DIR.mkdir(exist_ok=True)
     (INDEX_DIR / "rows.json").write_text(
@@ -400,6 +635,7 @@ def build_index(pdf_path=PDF_PATH, progress=None):
         np.save(INDEX_DIR / "embeddings.npy", emb)
 
     meta = {"pdf": pdf_path.name, "rows": len(rows), "chunks": len(chunks),
+            "ocr": ocr_flag["used"],
             "ingested": time.strftime("%Y-%m-%d %H:%M")}
     (INDEX_DIR / "meta.json").write_text(
         json.dumps(meta, ensure_ascii=False), encoding="utf-8")
