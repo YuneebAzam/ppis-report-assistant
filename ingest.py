@@ -71,14 +71,20 @@ def group_words_into_lines(words):
     position, each word a dict with text/x0/x1/top in PDF point units."""
     words = [w for w in words if w["text"]]
     words.sort(key=lambda w: (w["top"], w["x0"]))
-    lines, cur, cur_top = [], [], None
+    lines, cur, cur_sum = [], [], 0.0
     for w in words:
-        if cur_top is None or abs(w["top"] - cur_top) <= 3:
-            cur.append(w)
-            cur_top = w["top"] if cur_top is None else cur_top
-        else:
+        # Compare against the running MEAN top of the line so far, not
+        # the first word's top. A single outlier -- typically a table
+        # rule misread as "|", sitting a couple of points high -- would
+        # otherwise anchor the whole line and push genuinely aligned
+        # words just past the tolerance onto a second line, splitting one
+        # table row in two (observed on a Grand Total row, which then
+        # lost half its figures).
+        if cur and abs(w["top"] - cur_sum / len(cur)) > 3.5:
             lines.append(cur)
-            cur, cur_top = [w], w["top"]
+            cur, cur_sum = [], 0.0
+        cur.append(w)
+        cur_sum += w["top"]
     if cur:
         lines.append(cur)
     for ln in lines:
@@ -163,20 +169,173 @@ def get_word_lines_ocr(fitz_page, dpi=OCR_DPI):
     tcmd = locate_tesseract()
     if tcmd:
         pytesseract.pytesseract.tesseract_cmd = tcmd
-    data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+    # --psm 6 ("assume a single uniform block of text") instead of the
+    # default automatic page segmentation. On these report pages the
+    # automatic mode splits a table into separate blocks and then drops
+    # whole columns: on one reserves page it read only 1 of the 3 numbers
+    # in each sub-total row (returning Cumulative Production where
+    # Original Recoverable was asked for), and across sampled table pages
+    # it found ~1.3x fewer numbers overall (3x fewer on the worst page).
+    # Treating the page as one block keeps columns aligned to their rows.
+    data = pytesseract.image_to_data(img, config="--psm 6",
+                                     output_type=pytesseract.Output.DICT)
 
-    words = []
+    words = words_from_ocr(data, zoom)
+    lines = group_words_into_lines(words)
+
+    # The two segmentation modes fail in different, complementary ways:
+    # --psm 6 keeps a table's columns aligned to their rows but can miss
+    # a whole row that sits apart from the main block (a Grand Total in
+    # its own box under the table), while the automatic mode finds that
+    # row but drops columns elsewhere. Take psm 6 as the base and add
+    # only rows the automatic pass found in vertical gaps psm 6 left
+    # empty, so nothing is overwritten -- purely additive recovery.
+    auto = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+    lines = merge_missing_lines(lines, group_words_into_lines(
+        words_from_ocr(auto, zoom)))
+    return reread_header_lines(lines, img, zoom, pytesseract)
+
+
+def words_from_ocr(data, zoom):
+    """Tesseract's per-word output -> word dicts in PDF point units."""
+    out = []
     for i in range(len(data["text"])):
         text = re.sub(r"\s+", " ", data["text"][i]).strip()
         if not text or int(data["conf"][i]) < 0:
             continue
-        words.append({
+        if is_ocr_noise(text, int(data["conf"][i])):
+            continue
+        out.append({
             "text": text,
             "x0": data["left"][i] / zoom,
             "x1": (data["left"][i] + data["width"][i]) / zoom,
             "top": data["top"][i] / zoom,
         })
-    return group_words_into_lines(words)
+    return out
+
+
+def merge_missing_lines(base_lines, extra_lines, v_tol=6):
+    """Fill in what the base OCR pass missed, using a second pass.
+
+    Works word by word rather than line by line. A word from the second
+    pass is taken only when the base pass has nothing in that space --
+    no word overlapping it horizontally within the same horizontal band.
+    That covers both failure shapes seen in practice: an entire row the
+    base pass skipped (a Grand Total sitting in its own box), and a
+    single value missing from a row the base pass otherwise read (one
+    page's grand total kept its Original and Balance figures but lost
+    Cumulative). Existing words are never replaced, so a value the base
+    pass did read always wins over the second pass's version of it."""
+    if not extra_lines:
+        return base_lines
+    base_words = [w for ln in base_lines for w in ln]
+    added = []
+    for ln in extra_lines:
+        for w in ln:
+            collides = False
+            for b in base_words:
+                if abs(b["top"] - w["top"]) > v_tol:
+                    continue
+                if w["x0"] < b["x1"] and b["x0"] < w["x1"]:
+                    collides = True
+                    break
+            if not collides:
+                added.append(w)
+    if not added:
+        return base_lines
+    return group_words_into_lines(base_words + added)
+
+
+HAS_DIGIT_RE = re.compile(r"\d")
+
+
+def is_ocr_noise(text, conf, min_conf=40, min_len=11):
+    """Long, low-confidence, all-alphabetic tokens are OCR hallucinating
+    words out of table rules and shaded cell backgrounds, e.g.
+    "Mthetieieieietintal" or "Denadiunatinn" appearing inside a column
+    header. Left in, they bury the real header word next to them
+    ("origina") and the model then cannot tell one column from another.
+
+    Uses Tesseract's own per-word confidence rather than a hand-rolled
+    text-shape heuristic. Deliberately narrow so it cannot eat real
+    content: anything containing a digit is always kept (no figure is
+    ever dropped), and genuine short misreads keep their place --
+    observed noise tokens ran 11-19 characters at confidence 9-22, while
+    real misread header words ("orignal", "comutatve", 7-9 chars) sit
+    below the length bar and survive even at low confidence. Losing one
+    of those costs a column its name, so the bar only catches tokens
+    longer than any real word seen in these headers."""
+    if HAS_DIGIT_RE.search(text):
+        return False
+    letters = re.sub(r"[^A-Za-z]", "", text)
+    return len(letters) >= min_len and conf < min_conf
+
+
+def reread_header_lines(lines, img, zoom, pytesseract, max_scan=8):
+    """Re-OCR a table's column-header lines from their own tight crop.
+
+    In the whole-page pass the descenders of the big title printed just
+    above a table bleed into the header line below it, and Tesseract then
+    returns character salad for the header even though the header itself
+    is perfectly crisp -- one page's "Company Field Discovery Year
+    Original Recoverable ..." came back as "Pew fre ore pe Temes [ia".
+    Losing those words matters more than losing any single cell, because
+    they are what tells every value below which column it belongs to
+    (without them "Original Recoverable" and "Balance Recoverable" become
+    indistinguishable). Re-reading just the header's own horizontal band,
+    with nothing above it to bleed in, recovers them.
+
+    Only lines above the table body are considered (scanning stops at the
+    first line that looks like data, i.e. mostly numbers), and a re-read
+    is kept only when it yields more alphabetic content than the original
+    -- so this cannot make a page worse than it already was."""
+    for idx, ln in enumerate(lines[:max_scan]):
+        n_num = sum(1 for w in ln if HAS_DIGIT_RE.search(w["text"]))
+        if len(ln) >= 3 and n_num >= len(ln) / 2:
+            break  # reached the data rows
+        if len(ln) < 2:
+            continue
+        # Band this line only: from its own top down to the next line's
+        # top. Cropping a fixed small height instead cuts tall header
+        # text in half and makes the re-read worse than the original.
+        top = min(w["top"] for w in ln) * zoom
+        if idx + 1 < len(lines):
+            bot = min(w["top"] for w in lines[idx + 1]) * zoom
+        else:
+            bot = top + 60 * zoom / (400 / 72)
+        crop = img.crop((0, max(int(top) - 6, 0), img.width,
+                         min(int(bot) + 4, img.height)))
+        if crop.height < 12:
+            continue
+        try:
+            d = pytesseract.image_to_data(
+                crop, config="--psm 6", output_type=pytesseract.Output.DICT)
+        except Exception:
+            continue
+        new_words = []
+        for i in range(len(d["text"])):
+            t = re.sub(r"\s+", " ", d["text"][i]).strip()
+            if not t or int(d["conf"][i]) < 0:
+                continue
+            if is_ocr_noise(t, int(d["conf"][i])):
+                continue
+            new_words.append({
+                "text": t,
+                "x0": d["left"][i] / zoom,
+                "x1": (d["left"][i] + d["width"][i]) / zoom,
+                "top": min(w["top"] for w in ln),
+            })
+        def real_words(ws):
+            """Count tokens of 4+ letters -- a proxy for actual header
+            words. Plain letter-count is not enough: OCR noise like
+            "ne en nn En EEE SEE SEES" has many letters but no real
+            words, and would otherwise be accepted over the original."""
+            return sum(1 for w in ws
+                       if len(re.sub(r"[^A-Za-z]", "", w["text"])) >= 4)
+        if new_words and real_words(new_words) > real_words(ln):
+            new_words.sort(key=lambda w: w["x0"])
+            lines[idx] = new_words
+    return lines
 
 
 def detect_boundaries(lines):
@@ -210,8 +369,17 @@ def detect_boundaries(lines):
 
 SUBTOTAL_RE = re.compile(r"^Sub-?\s?Totals?:?$", re.IGNORECASE)
 SUBTOTAL_NAMED_RE = re.compile(r"^Sub[\s-]?Totals?\s*\(([^)]+)\)$", re.IGNORECASE)
-TOTALROW_RE = re.compile(r"^(Sub-?\s?Totals?:?( for .*)?|Grand )?Totals?"
-                         r"( area)?:?$", re.IGNORECASE)
+# A standalone "(Name)" cell -- the tail of a "Sub Total (Name)" label that
+# OCR split across two column bins. Requires a letter so it cannot match a
+# parenthesised number (some tables show negatives as "(1.234)").
+PAREN_NAME_RE = re.compile(r"^\(\s*([^)\d][^)]*)\)$")
+# A surviving fragment of a "Sub Total" label after OCR dropped the rest.
+SUBTOTAL_FRAGMENT_RE = re.compile(r"^(Sub|Total|Sub-|Subtotal)$", re.IGNORECASE)
+# Matches a row-label cell that announces a total. Anchored at the start
+# but open-ended at the end, because a report may qualify the label --
+# "Grand total of E&P Expenditure" is still a grand total, and requiring
+# an exact match left that row unflagged and therefore unfindable.
+TOTALROW_RE = re.compile(r"^(grand\s+|sub[\s-]?)?totals?\b", re.IGNORECASE)
 NUMCELL_RE = re.compile(r"^-?[\d.,()/%\s]+$")
 ENTITY_COL_RE = re.compile(r"company|operator|operating", re.IGNORECASE)
 FRAG_STOP = {"operating", "company", "financial", "activities",
@@ -231,18 +399,54 @@ def header_signature(lines, n=2):
     return sig if any(sig) else None
 
 
+def signatures_match(a, b, min_ratio=0.5):
+    """Whether two page header signatures denote the same table.
+
+    Exact equality is right for a clean text layer, where a repeated
+    header is reproduced byte for byte. It fails completely on OCR: the
+    same printed header comes back slightly differently on every page
+    ("Right Holdings in Mining/D&P Leases" vs "Right | sno] holdings
+    Lease in Mining/D&P | Area Leases"), so a 10-page table gets split
+    into several one-page "sections". That is costly, because column
+    boundaries and the entity fill-down are shared per section: split
+    them and continuation pages lose the company each row belongs to,
+    which is exactly what a question about a multi-page subtotal needs.
+
+    Compares sets of alphabetic word-stems (first 4 letters, which
+    absorbs OCR letter damage) by Jaccard similarity -- intersection over
+    UNION. Using the smaller set as the denominator instead would call
+    two different tables the same whenever one title's words are mostly a
+    subset of the other's: "Oil 2P Reserves as on 30th June 2018
+    (Million US Barrels)" and "Gas 2P Reserves as on 30th June 2019
+    (Billion Cubic Feet)" share everything except the few words that
+    actually distinguish them. Jaccard counts those differing words
+    against the score, separating the two clearly."""
+    if a is None or b is None:
+        return False
+
+    def stems(sig):
+        words = re.findall(r"[A-Za-z]{3,}", " ".join(sig).lower())
+        return {w[:4] for w in words}
+
+    sa, sb = stems(a), stems(b)
+    if not sa or not sb:
+        return a == b
+    return len(sa & sb) / len(sa | sb) >= min_ratio
+
+
 def group_into_sections(pages_words):
     """Group consecutive pages that share the same header text -- i.e. a
     single table continuing across pages -- so column boundaries can be
     shared across all of a table's pages instead of derived per page."""
-    sections, prev_sig = [], object()
+    sections, prev_sig = [], None
     for idx, lines in enumerate(pages_words):
         sig = header_signature(lines)
-        if sig is not None and sig == prev_sig:
+        if sections and signatures_match(sig, prev_sig):
             sections[-1].append(idx)
         else:
             sections.append([idx])
-        prev_sig = sig
+        if sig is not None:
+            prev_sig = sig
     return sections
 
 
@@ -308,6 +512,82 @@ def section_title(first_page_lines):
             title = f"{title} ({m.group(0)})"
             break
     return title
+
+
+DECIMAL_TAIL_RE = re.compile(r"^\.\d+$")
+INT_HEAD_RE = re.compile(r"^-?[\d,]+$")
+# A reported figure, as opposed to a serial number: has a decimal part
+# or thousands separators, or is simply too long to be a row number.
+FIGURE_RE = re.compile(r"^-?\d{1,3}(,\d{3})+(\.\d+)?$|^-?\d+\.\d+$|^-?\d{4,}$")
+
+
+def rejoin_split_decimals(cells):
+    """Repair a number whose decimal part was binned as its own column.
+
+    A wide figure sitting near a column boundary can have its fractional
+    part pushed into the next cell, so "282,491.643" arrives as
+    "282,491" followed by ".643" -- the figure is then wrong by three
+    orders of magnitude wherever it is used. Only joins when the left
+    cell is a bare integer and the right is exactly a decimal tail, so
+    two genuine values are never merged."""
+    out = list(cells)
+    for i, left in enumerate(out):
+        left = left.strip()
+        if not INT_HEAD_RE.match(left):
+            continue
+        # The decimal tail is not always in the very next bin -- empty
+        # columns can sit between the two halves -- so scan forward past
+        # blanks for it.
+        for j in range(i + 1, len(out)):
+            right = out[j].strip()
+            if not right:
+                continue
+            if DECIMAL_TAIL_RE.match(right):
+                out[i] = left + right
+                out[j] = ""
+            break
+    return out
+
+
+def plausible_entity(text):
+    """Whether a string can reasonably be a company or category name,
+    used to spot entities that are really OCR debris. Table rules and
+    shaded backgrounds produce fragments like "on = FN", "— =z" or "a",
+    which then become the owner of a subtotal row and make it
+    unfindable by its real name."""
+    if not text:
+        return False
+    letters = re.sub(r"[^A-Za-z]", "", text)
+    if len(letters) < 3:
+        return False
+    if re.search(r"[=|~^{}\\<>]", text):
+        return False
+    return len(letters) / len(text) >= 0.5
+
+
+def best_section_labels(section, pages_words, bounds):
+    """Column labels from whichever page of a table OCR read best.
+
+    Runs the normal label derivation once per page of the section and
+    keeps the set containing the most real words (4+ letters), which is
+    a direct proxy for how much of the printed header survived scanning.
+    Returns None if no page yields labels, leaving the caller's usual
+    first-page-wins behaviour untouched."""
+    if not bounds:
+        return None
+    best, best_score = None, 0
+    for idx in section:
+        probe = {"col_labels": None, "header_cells": [],
+                 "entity_col": 0, "current_entity": ""}
+        render_page(pages_words[idx], bounds, probe, 0, "", [])
+        labels = probe.get("col_labels")
+        if not labels:
+            continue
+        score = sum(1 for l in labels
+                    for w in re.findall(r"[A-Za-z]{4,}", l))
+        if score > best_score:
+            best, best_score = labels, score
+    return best
 
 
 def find_entity_col(col_labels):
@@ -407,10 +687,19 @@ def render_page(lines, bounds, state, pageno, title, rows):
         if bounds:
             cells = [[] for _ in range(len(bounds) + 1)]
             for w in ln:
-                mid = (w["x0"] + w["x1"]) / 2
-                cells[bisect.bisect_left(bounds, mid)].append(w["text"])
+                # Numbers in these tables are right-aligned, so their
+                # midpoint is the stable way to place them. Text labels
+                # are LEFT-aligned, and a long one (e.g. "Recoverable")
+                # has a midpoint far to the right of where it starts --
+                # enough to fall into the next column and detach a header
+                # word from the column it labels. Binning alphabetic
+                # tokens by their left edge keeps them with their column.
+                anchor = (w["x0"] if not HAS_DIGIT_RE.search(w["text"])
+                          else (w["x0"] + w["x1"]) / 2)
+                cells[bisect.bisect_left(bounds, anchor)].append(w["text"])
             cells = [GLUED_RE.sub(r"\1 ", " ".join(c).strip())
                      for c in cells]
+            cells = rejoin_split_decimals(cells)
 
             if any(re.search(r"\bTable\s+\d", c) for c in cells):
                 state["header_cells"], state["col_labels"] = [], None
@@ -441,6 +730,24 @@ def render_page(lines, bounds, state, pageno, title, rows):
             # doesn't depend on the company name having been seen earlier.
             named_subtotal = next(
                 (m for c in cells if (m := SUBTOTAL_NAMED_RE.match(c))), None)
+            # OCR can split "Sub Total (OGDCL)" across two column bins,
+            # leaving a bare "Sub Total" in one cell and "(OGDCL)" in the
+            # next. The parenthesised name is still the row's own label
+            # and beats the filled-down entity (which by then is whatever
+            # data row came last, e.g. a field name). Generic: any
+            # "(Name)" on a subtotal row, no report-specific wording.
+            if not named_subtotal:
+                paren = next(
+                    (m for c in cells if (m := PAREN_NAME_RE.match(c))), None)
+                # OCR sometimes loses part of the label too, leaving just
+                # "Sub" (or just "Total") beside the "(Name)" cell, which
+                # the strict Sub-Total patterns above will not match. A
+                # numeric row carrying a standalone "(Name)" next to a
+                # Sub/Total fragment is still that company's subtotal
+                # line: without this the row keeps a junk entity ("Sub")
+                # and cannot be found by the company's name at all.
+                if paren and any(SUBTOTAL_FRAGMENT_RE.match(c) for c in cells):
+                    named_subtotal, is_subtotal = paren, True
 
             entity = ""
             if col_labels is not None and n_num >= 1:
@@ -464,6 +771,18 @@ def render_page(lines, bounds, state, pageno, title, rows):
                         and not re.match(r"^[\d.,()-]+$", ecell):
                     state["current_entity"] = ecell
                 entity = state.get("current_entity", "")
+                # Some tables group rows under a heading in the same
+                # column as the rows themselves (GOP Receipts: "Royalty"
+                # over Oil/Gas, then "Sub total") rather than in a
+                # separate company column. Filling down then leaves the
+                # subtotal owned by the last detail row ("Gas"), or by
+                # OCR junk from a garbled column. Fall back to the last
+                # heading -- a labelled row carrying no figures, which is
+                # what a category line looks like -- so the subtotal is
+                # attributed to "Royalty"/"Dividend" and can be found by
+                # that name.
+                if is_subtotal and not plausible_entity(entity):
+                    entity = state.get("last_heading", "") or entity
                 if named_subtotal:
                     entity = named_subtotal.group(1).strip()
                     is_subtotal = True
@@ -476,6 +795,22 @@ def render_page(lines, bounds, state, pageno, title, rows):
                         if SUBTOTAL_RE.match(c):
                             cells[i] = f"Sub-Total for {entity}"
                     state["current_entity"] = ""
+
+                # Remember category headings for the fallback above: a
+                # row carrying one short text label and no figures. A
+                # serial number beside the label ("2  Royalty") does not
+                # disqualify it -- only a real figure does, so FIGURE_RE
+                # ignores bare small integers.
+                if not is_subtotal:
+                    texts = [c for c in cells
+                             if c and not FIGURE_RE.match(c.strip())
+                             and not re.fullmatch(r"\d{1,3}", c.strip())]
+                    figures = [c for c in cells
+                               if c and FIGURE_RE.match(c.strip())]
+                    if (not figures and len(texts) == 1
+                            and plausible_entity(texts[0])
+                            and len(texts[0]) <= 40):
+                        state["last_heading"] = texts[0]
 
                 row_cells = {}
                 for i in range(min(len(cells), len(col_labels))):
@@ -575,6 +910,17 @@ def extract_all(pdf_path=PDF_PATH, progress=None, ocr_flag=None):
         bounds = section_boundaries(section, pages_words)
         state = {"col_labels": None, "header_cells": [],
                  "entity_col": 0, "current_entity": ""}
+        # A table repeats its column header on every page it spans, and
+        # OCR damages that header differently each time. Taking the
+        # first page's version can saddle the whole table with unusable
+        # labels ("freee | viscovery Year" over a column of figures)
+        # while a later page read the same header cleanly -- and a table
+        # whose columns have no usable names cannot be searched by
+        # column. Seed the section with the best header any of its pages
+        # produced.
+        best = best_section_labels(section, pages_words, bounds)
+        if best:
+            state["col_labels"], state["entity_col"] = best, find_entity_col(best)
         page_text_lines = {}
         n_rows_before = len(rows)
         for idx in section:
@@ -583,7 +929,26 @@ def extract_all(pdf_path=PDF_PATH, progress=None, ocr_flag=None):
                 pages_words[idx], bounds, state, pageno, title, rows)
         if len(rows) == n_rows_before:  # no table detected: narrative text
             chunk_narrative_pages(section, page_text_lines, chunks)
-    return rows, chunks
+    return drop_non_table_pages(rows), chunks
+
+
+def drop_non_table_pages(rows, min_cells=3):
+    """Discard "rows" scraped from pages that hold a chart rather than a
+    table. The report's bar charts are full-page images like every other
+    page, so image/vector counts cannot tell them apart; what does is
+    that OCR finds no multi-column structure on them -- just axis
+    numbers, rotated company names and a legend, which arrive as a
+    handful of one-cell rows with junk labels ("a", "fon", "- =z").
+    Left in, they answer questions with meaningless figures, and the
+    report's charts only restate numbers its tables already give. A page
+    keeps its rows as soon as ANY row has min_cells columns, so a real
+    table is never dropped."""
+    by_page = {}
+    for r in rows:
+        by_page.setdefault(r["page"], []).append(r)
+    keep_pages = {p for p, rs in by_page.items()
+                  if any(len(r["cells"]) >= min_cells for r in rs)}
+    return [r for r in rows if r["page"] in keep_pages]
 
 
 def embed_all(texts, progress=None):

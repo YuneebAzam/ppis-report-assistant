@@ -57,6 +57,12 @@ Rules:
 prefer them when the question asks for a total.
 - A line starting with [COMPUTED] is a sum calculated by this app from \
 the matching rows; present it as a computed sum, not a printed figure.
+- A line starting with [ANSWER CELL] is the exact figure this app \
+matched to the question, already checked against the column names. When \
+it is present, answer with THAT figure and its page, even if other rows \
+below show similar-looking numbers. Column names may contain scanning \
+errors ("comutatve" for Cumulative, "origina" for Original); the \
+[ANSWER CELL] line has already accounted for them.
 - NEVER do arithmetic yourself. If the answer needs math that is not \
 already given, say the report doesn't state it directly.
 - If the question says "total" but a single row directly gives the value \
@@ -81,8 +87,10 @@ figures digit for digit; never rescale them (14.73 million must not \
 become 14,730).
 - NEVER repeat or quote the raw row data lines back to the user. Reply \
 with ONE short sentence containing just the specific value asked for \
-(plus unit and page number). Example: "OGDCL's total development \
-expenditure was 73,097.873 million rupees (page 96)."
+(plus unit and page number), in this shape: \
+"<company>'s <metric> was <figure> <unit> (page <n>)." \
+The placeholders show the SHAPE only -- never emit a company, figure or \
+page that is not in the rows above.
 - Keep answers short, clear and friendly."""
 
 STOPWORDS = {"what", "was", "the", "for", "total", "how", "many", "much",
@@ -304,6 +312,52 @@ def computed_sums(question, hits):
     return "; ".join(parts) if parts else None
 
 
+def pinpoint_cell(question, hits):
+    """Name the single cell that answers the question, when one column
+    clearly matches, so the model does not have to pick from a row of
+    lookalike figures.
+
+    OCR mangles column headers just enough to break plain word matching
+    while leaving them readable to a person: a "Comulative Production"
+    column arrives as "comutatve Production" and "Original Recoverable"
+    as "origina Recoverable". The question's own words then match no
+    label exactly, and a small model picks a neighbouring number
+    instead. Fuzzy-matching each question word against the label's words
+    tolerates that damage, and picking the column here keeps the value
+    selection in Python -- the model is left only to phrase it, the same
+    split already used for sums."""
+    import difflib
+    words = [w for w in query_words(question) if len(w) >= 5]
+    if not words or not hits:
+        return None
+    # Consider printed total rows first and stop if one matches: a
+    # question naming a company wants that company's total line, not one
+    # of the individual field rows above it that share its wording.
+    ordered = [h for h in hits if h["is_total"]] or list(hits)
+    best = (0.0, None, None, None)
+    for h in ordered[:4]:
+        for label, value in h["cells"].items():
+            if not NUM_RE.match(value.replace(",", "").strip()):
+                continue
+            label_words = re.findall(r"[A-Za-z]{3,}", label.lower())
+            if not label_words:
+                continue
+            score = 0.0
+            for qw in words:
+                m = max((difflib.SequenceMatcher(None, qw, lw).ratio()
+                         for lw in label_words), default=0.0)
+                if m >= 0.7:          # tolerate OCR letter damage
+                    score += m
+            if score > best[0]:
+                best = (score, label, value, h)
+    # Require two matching label words (e.g. "original"+"recoverable"),
+    # so a single generic hit like "production" cannot claim the row.
+    if best[0] >= 1.5:
+        _, label, value, h = best
+        return f"[ANSWER CELL] (page {h['page']}) {label} = {value}"
+    return None
+
+
 def essential_cells(cells):
     """When a row carries 2+ pre-computed '... Total (In MM Rs.)' columns
     (Table 5.2's rows: Exploration/Appraisal/Development totals, each
@@ -320,8 +374,10 @@ def essential_cells(cells):
             if k in total_keys or not NUM_RE.match(v.replace(",", ""))}
 
 
-def format_rows(hits, extra):
+def format_rows(hits, extra, pinpoint=None):
     lines = []
+    if pinpoint:
+        lines.append(pinpoint)
     for r in hits:
         tag = "[PRINTED TOTAL] " if r["is_total"] else ""
         ent = f" | entity: {r['entity']}" if r["entity"] else ""
@@ -397,9 +453,67 @@ def collapse_to_totals(hits):
     return out
 
 
+def restrict_to_named_table(question, rows):
+    """Pick the table first when the question names one, then let row
+    ranking work inside it.
+
+    Sibling tables ("Oil 2P Reserves ...", "Gas 2P Reserves ...") share
+    companies and column wording, so row scores alone can send an oil
+    question to the gas table -- especially when OCR left the oil
+    table's column labels more damaged than the gas table's, making the
+    wrong table the better *textual* match. The table title is the one
+    place the distinguishing word reliably survives, so a word that
+    appears in one table's title and not others decides the table
+    outright. Returns all rows unchanged when no title stands out."""
+    words = [w for w in query_words(question) if len(w) >= 3]
+    if not words:
+        return rows
+    titles = {r["table"] for r in rows if r["table"]}
+    if len(titles) < 2:
+        return rows
+    # A word is a table selector only if it is in some titles but not
+    # most -- "reserves" appears in both sibling titles and decides
+    # nothing, while "oil" or "gas" appears in one.
+    scores = {}
+    for t in titles:
+        tl = t.lower()
+        scores[t] = sum(1 for w in words
+                        if re.search(rf"\b{re.escape(w)}", tl))
+    best = max(scores.values())
+    if best == 0:
+        return rows
+    winners = {t for t, s in scores.items() if s == best}
+    discriminating = sum(1 for s in scores.values() if s == best)
+    if discriminating > 3:      # too many tables tie -- not a selector
+        return rows
+    picked = [r for r in rows if r["table"] in winners]
+    return picked or rows
+
+
+def same_table_as_best(hits):
+    """Keep only rows from the best-matching table.
+
+    Reports often carry near-identical sibling tables -- "Oil 2P
+    Reserves ..." and "Gas 2P Reserves ...", same companies, same column
+    names, different subject. A question naming one of them still
+    retrieves the other's rows, because the company name and the column
+    wording match there too. Showing both lets the model answer an oil
+    question from the gas table. The top-ranked hit already encodes
+    which table the question matched best, so anything from a different
+    table is dropped. Rows without a table label are always kept."""
+    if len(hits) < 2:
+        return hits
+    best_table = hits[0].get("table", "")
+    if not best_table:
+        return hits
+    return [h for h in hits
+            if h.get("table", "") == best_table or not h.get("table")]
+
+
 def build_context(question, rows, chunks, emb):
-    hits = search_rows(question, rows)
+    hits = search_rows(question, restrict_to_named_table(question, rows))
     hits = collapse_to_totals(hits)
+    hits = same_table_as_best(hits)
     wants_total = any(w in question.lower() for w in TOTAL_WORDS)
 
     # Once a printed total/sub-total row is available, drop the
@@ -420,7 +534,8 @@ def build_context(question, rows, chunks, emb):
     global_hits = [h for h in hits if not h["entity"] and h["is_total"]
                   and any(v.strip() == "Total" for v in h["cells"].values())]
     if global_hits:
-        return format_rows(global_hits, computed_sums(question, global_hits)), global_hits, []
+        return (format_rows(global_hits, computed_sums(question, global_hits),
+                            pinpoint_cell(question, global_hits)), global_hits, [])
 
     # Diffuseness is judged from only the top few hits (already
     # score-sorted), not the whole (up to MAX_ROWS) window -- a handful
@@ -430,7 +545,8 @@ def build_context(question, rows, chunks, emb):
     # clear best match at the top.
     distinct_entities = {h["entity"] for h in hits[:3] if h["entity"]}
     if hits and len(distinct_entities) <= DIFFUSE_ENTITY_LIMIT:
-        row_text = format_rows(hits, computed_sums(question, hits))
+        row_text = format_rows(hits, computed_sums(question, hits),
+                               pinpoint_cell(question, hits))
         # Below the strong, unambiguous global_hits case above, no
         # heuristic reliably tells a genuinely relevant table match apart
         # from a coincidental keyword collision (e.g. a "Reserves"
@@ -475,7 +591,8 @@ def build_context(question, rows, chunks, emb):
         text = "\n\n---\n\n".join(c["text"] for c in fallback)
         return text, [], fallback
     if hits:  # no narrative alternative -- fall back to the diffuse rows
-        return format_rows(hits, computed_sums(question, hits)), hits, []
+        return (format_rows(hits, computed_sums(question, hits),
+                            pinpoint_cell(question, hits)), hits, [])
     return "", [], []
 
 
@@ -484,8 +601,16 @@ def stream_answer(question, context, history):
                 f"Question: {question}")
     messages = [{"role": "system",
                  "content": SYSTEM_PROMPT.format(doc=doc_description())}]
+    # Carry only the earlier QUESTIONS, never the earlier answers.
+    # Answers are re-derived from the index every time, so replaying old
+    # ones lets a figure from a previous session outrank what retrieval
+    # just found -- reopening a saved chat had the model repeating a
+    # number that no longer exists in the index at all. Past questions
+    # still give follow-ups their context ("what about MOL?") without
+    # putting a stale figure in front of the model.
     for h in history[-6:]:
-        messages.append({"role": h["role"], "content": h["content"]})
+        if h["role"] == "user":
+            messages.append({"role": "user", "content": h["content"]})
     messages.append({"role": "user", "content": user_msg})
 
     with requests.post(f"{OLLAMA_URL}/api/chat",
@@ -549,8 +674,21 @@ with st.sidebar:
         st.session_state.messages = []
         st.session_state.conversation_id = str(uuid.uuid4())
         st.rerun()
+    meta_now = read_meta()
+    index_built = None
+    if meta_now and meta_now.get("ingested"):
+        try:
+            index_built = time.mktime(time.strptime(meta_now["ingested"],
+                                                    "%Y-%m-%d %H:%M"))
+        except ValueError:
+            index_built = None
     for c in list_conversations():
         label = c.get("title", "New chat")
+        # Answers in a chat older than the current index were produced
+        # from data that has since changed; mark them so an out-of-date
+        # figure on screen is not mistaken for a current one.
+        if index_built and c.get("updated", 0) < index_built:
+            label = "⚠ " + label
         is_current = c["id"] == st.session_state.conversation_id
         col1, col2 = st.columns([5, 1], vertical_alignment="center")
         with col1:
